@@ -1873,6 +1873,98 @@ async function xlsxSheets(buf, wanted) {
   }
   return out;
 }
+/* Catalogue d'appareils Machine Expert (dictionnaire de l'Auto_Pannel) : type -> [type, id, version, module, parent] */
+const HW_CAT = {
+  CAN_Layer: [15, '1003 008A', '1.76.3.0', '', 'LMC_PacDrive'], CAN_Manager: [16, '1003 008B', '1.76.3.0', '', 'CAN_Layer'],
+  ATV320: [18, '101A 2038', '1.2.11.0', '', 'CAN_Manager'],
+  ILM62: [4096, 'plc_id', 'plc_v', 'ILM62', 'Sercos_Master'], LXM62: [4096, 'plc_id', 'plc_v', 'LXM62DxS', 'Sercos_Master'],
+  LXM62_IO: [4096, 'plc_id', 'plc_v', 'LXM62IO', 'LXM62'], ILM62_IO: [4096, 'plc_id', 'plc_v', 'DIO8', 'ILM62'], LE_Enc: [4096, 'plc_id', 'plc_v', 'L_ENC', 'LMC_PacDrive'],
+  TM5NS31: [71, '1_TM5', 'plc_v', '', 'Sercos_Master'],
+  TM5SBET1: [72, '1_0x1bc2', '1.56.15.2', '', 'TM5NS31'], TM5SBER2: [72, '1_0x1bc1', '1.56.15.2', '', 'TM5NS31'], TM5C24D12R: [72, '1_0xb0d7', '1.56.15.2', '', 'TM5NS31'],
+  TM5SDI12D: [72, '1_0x1b95', '1.56.15.2', '', 'TM5NS31'], TM5SDO8TA: [72, '1_0x1b9d', '1.56.15.2', '', 'TM5NS31'], TM5SDO4R: [72, '1_0xa704', '1.56.15.2', '', 'TM5NS31'],
+  TM5SE1IC20005: [72, '1_0xb76b', 'plc_v', '', 'TM5NS31'], TM5SDI2DF: [72, '1_0x1b8e', '1.56.15.2', '', 'TM5NS31'], TM5SDI4DFS: [72, '1_0x1dbd', '6.20.113.240119', '', 'TM5NS31'],
+  TM5SDO4TAFS: [72, '1_0x2007', '6.20.113.240119', '', 'TM5NS31'], LXM62PS: [4096, '1003 0082', '1.80.1.2', 'LXM62PS', 'Sercos_Master'],
+  TM5SAO2L: [72, '1_0x1ba2', '1.56.15.2', '', 'TM5NS31'], TM5SAO4L: [72, '1_0x1ba3', '1.56.15.2', '', 'TM5NS31'],
+  EIPS_Scanner: [100, '1003 0096', '1.78.11.0', '', 'LMC_PacDrive'], EX500_GEN2: [101, '7_12_198_3', 'Major Revision=16#3, Minor Revision = 16#1', '', 'EIPS_Scanner']
+};
+const HW_FAM = t => t === 'CAN_Layer' || t === 'CAN_Manager' ? 'CAN' : t === 'ATV320' ? 'Variateur CAN' : t === 'LXM62PS' ? 'Alimentation' : t === 'TM5NS31' ? 'Tête de bus TM5' : /^TM5/.test(t) ? 'Module TM5' : t === 'EIPS_Scanner' || (HW_CAT[t] && HW_CAT[t][4] === 'EIPS_Scanner') ? 'Ethernet/IP' : 'Autre';
+const EIPS_IP = '192.168.27.130';
+/* Nom d'appareil comme la macro Auto_Pannel : accents retirés, espaces et tirets -> _ */
+const hwName = s => String(s ?? '').trim().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[ -]/g, '_');
+const cellTxt = v => v == null ? '' : String(v).trim();
+function parseMateriel(sheets, asyn) {
+  const items = [], warn = [];
+  const atv = asyn.filter(a => /^ATV320/i.test(a.gamme));
+  if (atv.length) {
+    items.push({ nom: 'CAN_Layer', type: 'CAN_Layer' }, { nom: 'CAN_Manager', type: 'CAN_Manager' });
+    atv.forEach((a, k) => items.push({ nom: 'ATV320_' + a.nom, type: 'ATV320', nodeId: k + 1, desc: a.desc }));
+  }
+  const key = Object.keys(sheets).find(k => nrmE(k) === 'materiels');
+  if (!key) { warn.push('onglet « Matériels » introuvable : seuls le CAN et les ATV320 sont repris'); return { items, warn }; }
+  const ps = [], bus = [], eth = [];
+  sheets[key].forEach((r, i) => {
+    if (!r) return;
+    const B = cellTxt(r[1]), C = cellTxt(r[2]), E = cellTxt(r[4]), O = cellTxt(r[14]), P = cellTxt(r[15]), R = cellTxt(r[17]);
+    if (/^LXM62PD/i.test(E)) ps.push({ nom: hwName(B) + (R ? '_' + R : ''), type: 'LXM62PS', ref: E, ligne: i + 1 });
+    else if (nrmE(O) === 'ethernet ip') eth.push({ nom: hwName(B) + (R ? '_' + R : ''), type: E.replace(/-/g, '_'), ip: P, ref: E, ligne: i + 1 });
+    else if (C && E && (HW_CAT[E] || /^TM5/i.test(E))) bus.push({ nom: C, type: E, ligne: i + 1 });
+  });
+  items.push(...ps, ...bus);
+  if (eth.length) items.push({ nom: 'EIPS_Scanner', type: 'EIPS_Scanner', ip: EIPS_IP }, ...eth);
+  // parent réel : les modules TM5 vont sous la dernière tête de bus rencontrée
+  let tete = null;
+  items.forEach(x => { if (x.type === 'TM5NS31') tete = x.nom; x.parent = /^TM5/.test(x.type) && x.type !== 'TM5NS31' ? (tete || 'TM5NS31 ?') : (HW_CAT[x.type] ? HW_CAT[x.type][4] : '?'); x.connu = !!HW_CAT[x.type]; });
+  const vus = new Set();
+  const out = items.filter(x => { if (!x.nom || vus.has(x.nom)) { if (x.nom) warn.push('« ' + x.nom + ' » en double dans le dossier : gardé une fois'); return false; } vus.add(x.nom); return true; });
+  if (out.some(x => !x.connu)) warn.push('types absents du catalogue d’appareils : ' + [...new Set(out.filter(x => !x.connu).map(x => x.type))].join(', ') + ' (le script ne saura pas les créer)');
+  return { items: out, warn };
+}
+function hwDiff(newItems) {
+  const old = curProj()?.materiel || [], oldE = old.filter(x => x.src !== 'manuel'), man = old.filter(x => x.src === 'manuel');
+  const byN = new Map(oldE.map(x => [x.nom, x])), newN = new Set(newItems.map(x => x.nom));
+  const sig = x => [x.type, x.parent, x.ip || '', x.nodeId || ''].join('|');
+  const rows = newItems.map(x => { const o = byN.get(x.nom); return { ...x, etat: !o ? 'nouveau' : sig(o) !== sig(x) ? 'maj' : 'ok' }; });
+  const retires = oldE.filter(x => !newN.has(x.nom)).map(x => x.nom);
+  const remplaces = man.filter(x => newN.has(x.nom)).map(x => x.nom);
+  const n = { nouveau: rows.filter(r => r.etat === 'nouveau').length, maj: rows.filter(r => r.etat === 'maj').length, retires: retires.length };
+  return { rows, retires, remplaces, man: man.filter(x => !newN.has(x.nom)), n, change: n.nouveau + n.maj + n.retires > 0 || remplaces.length > 0 };
+}
+function hwTable(list, withState, del) {
+  return `<div class="tblwrap elecwrap"><table><thead><tr><th>Appareil</th><th>Type</th><th>Famille</th><th>Sous</th><th>IP / Node-ID</th>${withState ? '<th>Action</th>' : ''}${del ? '<th></th>' : ''}</tr></thead><tbody>${list.map((x, k) => `<tr class="${withState ? 'el-' + x.etat : ''}">
+    <td><b>${esc(x.nom)}</b>${x.desc ? `<div class="el-sub">${esc(x.desc)}</div>` : ''}${x.src === 'manuel' ? '<div class="el-sub">ajouté à la main</div>' : ''}</td>
+    <td>${esc(x.type)}${x.connu === false || !HW_CAT[x.type] ? ' <span class="el-warn">hors catalogue</span>' : ''}</td><td>${esc(HW_FAM(x.type))}</td><td>${esc(x.parent || '')}</td>
+    <td>${esc(x.ip || (x.nodeId != null ? 'Node-ID ' + x.nodeId : ''))}</td>
+    ${withState ? `<td>${x.etat === 'nouveau' ? '<b>Nouveau</b>' : x.etat === 'maj' ? 'Modifié' : '<span class="el-sub">Inchangé</span>'}</td>` : ''}
+    ${del ? `<td>${x.src === 'manuel' ? `<button class="btn ghost" data-hwdel="${k}">Retirer</button>` : ''}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+}
+function hwPanel() {
+  const cur = curProj(), L = cur.materiel || [], heads = L.filter(x => x.type === 'TM5NS31').map(x => x.nom);
+  const f = S.hwForm || (S.hwForm = { nom: '', type: 'TM5SDI12D', val: '', parent: heads[heads.length - 1] || '' });
+  const isTm5 = /^TM5/.test(f.type) && f.type !== 'TM5NS31';
+  const nAx = pAxes().filter(a => a.gamme).length;
+  return `<div class="pform elecform"><div class="memsg"><b>Matériel du projet</b> : ${L.length} appareil${L.length > 1 ? 's' : ''}, repris du dossier élec ou ajoutés ici. ${nAx ? `Les variateurs DRV_, cartes IO_ et codeurs LE_ de ${nAx} axe${nAx > 1 ? 's' : ''} viennent des axes.` : ''} Un appareil du dossier se change en réimportant le dossier ; ceux ajoutés à la main restent après chaque import.</div>
+    ${L.length ? hwTable(L, false, true) : '<div class="memsg">Aucun matériel : importe le dossier élec ou ajoute un appareil.</div>'}
+    <div class="inp text" style="min-width:150px"><input id="hwNom" placeholder="Nom (ex. DI6_1)" value="${esc(f.nom)}" autocomplete="off"></div>
+    <select id="hwType" aria-label="Type">${Object.keys(HW_CAT).filter(t => !/^(LXM62|ILM62|LXM62_IO|ILM62_IO|LE_Enc)$/.test(t)).map(t => `<option ${t === f.type ? 'selected' : ''}>${t}</option>`).join('')}</select>
+    ${isTm5 ? `<select id="hwParent" aria-label="Tête de bus">${heads.length ? heads.map(h => `<option ${h === f.parent ? 'selected' : ''}>${esc(h)}</option>`).join('') : '<option value="">aucune tête TM5NS31</option>'}</select>` : ''}
+    ${f.type === 'ATV320' || HW_FAM(f.type) === 'Ethernet/IP' ? `<div class="inp text" style="min-width:140px"><input id="hwVal" placeholder="${f.type === 'ATV320' ? 'Node-ID' : 'Adresse IP'}" value="${esc(f.val)}" autocomplete="off"></div>` : ''}
+    <button class="btn primary" id="hwAdd">Ajouter</button><button class="btn" id="hwClose">Fermer</button></div>`;
+}
+/* Les appareils ajoutés à la main reprennent leur place (après l'appareil qui les précédait, sinon en fin de leur bus) */
+function mergeHw(elec, man) {
+  const out = elec.slice();
+  for (const x of man) {
+    let at = out.findIndex(y => y.nom === x.apres);
+    if (at < 0) out.forEach((y, k) => { if (y.nom === x.parent || y.parent === x.parent) at = k; });
+    out.splice(at >= 0 ? at + 1 : out.length, 0, x);
+  }
+  return out;
+}
+async function hwSave(list, msg) {
+  const cur = curProj();
+  try { await writeDoc('projects', cur.id, { ...strip(cur), materiel: list }); setStatus(msg); onData(); }
+  catch (e) { setStatus('Impossible : ' + (e.message || e.code), true); }
+}
 const ELEC_CHARGE = { MC: 'convoyeur', MR: 'rotatif', MT: 'lineaire', MP: 'bielle' };
 function parseElec(sheets) {
   const key = Object.keys(sheets).find(k => nrmE(k) === 'liste actionneurs');
@@ -1883,19 +1975,19 @@ function parseElec(sheets) {
   const H = {}; rows[hi].forEach((v, j) => { const k = nrmE(v); if (k && H[k] == null) H[k] = j; });
   const col = (r, ...names) => { for (const nm of names) { const j = H[nm]; const v = j != null ? r[j] : null; if (v != null && String(v).trim() !== '' && String(v) !== '#N/A') return v; } return null; };
   const pos = v => { const x = typeof v === 'number' ? v : parseFloat(String(v ?? '').replace(',', '.')); return isFinite(x) && x > 0 ? x : null; };
-  const servo = [], autres = {};
+  const servo = [], autres = {}, asyn = [];
   for (let i = hi + 1; i < rows.length; i++) {
     const r = rows[i]; if (!r) continue;
     const gammeTxt = String(col(r, 'gamme') || '').trim(), gamme = gammeTxt.toUpperCase();
     let nom = String(col(r, 'reperes') || '').trim();
     if (!nom) { const t = col(r, 'type'), n = col(r, 'n°'); if (t && n != null) nom = String(t).trim() + String(n).trim(); }
     if (!nom || !gamme) continue;
-    if (!/^(LXM62|ILM62)/.test(gamme)) { autres[gammeTxt] = (autres[gammeTxt] || 0) + 1; continue; }
+    if (!/^(LXM62|ILM62)/.test(gamme)) { autres[gammeTxt] = (autres[gammeTxt] || 0) + 1; asyn.push({ nom, gamme, desc: String(col(r, 'nom') || col(r, 'designation') || '').trim() }); continue; }
     const drv = String(col(r, 'reference') || '').trim();
     servo.push({ ligne: i + 1, nom, desc: String(col(r, 'nom') || col(r, 'designation') || '').trim(), moteurRef: String(col(r, 'references') || '').trim(),
       frein: /^o(ui)?$/i.test(String(col(r, 'frein') || '').trim()), gamme: gamme.slice(0, 5), variateur: /^(LXM|ILM)/i.test(drv) ? drv : '', i: pos(col(r, 'i')), feed: pos(col(r, 'feed constant')) });
   }
-  return { servo, autres };
+  return { servo, autres, asyn };
 }
 const refKey = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 function matchMotor(ref, frein) {
@@ -1939,31 +2031,42 @@ function elecPanel() {
     <td>${r.a ? '<span class="el-sub">inchangé</span>' : esc(chargeLabel(r.typeCharge))}</td>
     <td>${r.etat === 'nouveau' ? '<b>Nouvel axe</b>' : r.etat === 'maj' ? 'Mise à jour : ' + r.ch.map(c => ELEC_LAB[c] || c).join(', ') : '<span class="el-sub">Déjà à jour</span>'}</td></tr>`).join('');
   return `<div class="pform elecform"><div class="memsg"><b>Dossier élec « ${esc(E.file)} »</b> : ${E.rows.length} axe${E.rows.length > 1 ? 's' : ''} brushless (LXM62 / ILM62)${autres ? ' · autres actionneurs du dossier, pas importés ici : ' + esc(autres) : ''}.
-    Le fichier est lu dans ce navigateur : il n’est ni enregistré ni envoyé. Seuls le nom, la désignation, le moteur et le variateur de chaque axe sont gardés.</div>
+    Le fichier est lu dans ce navigateur : il n’est ni enregistré ni envoyé. Seuls les axes (nom, désignation, moteur, variateur) et la liste du matériel (nom, type, IP, Node-ID) sont gardés.</div>
     <div class="tblwrap elecwrap"><table><thead><tr><th></th><th>Axe</th><th>Désignation</th><th>Moteur</th><th>Variateur</th><th>Charge proposée</th><th>Action</th></tr></thead><tbody>${tr}</tbody></table></div>
     ${E.absents.length ? `<div class="memsg">Dans le projet mais pas dans le dossier : ${E.absents.map(esc).join(', ')} (rien n’est supprimé).</div>` : ''}
     <div class="memsg">Réducteur, charge et mouvement restent à compléter dans chaque axe. Ce qui est déjà saisi n’est jamais écrasé.</div>
-    <button class="btn primary" id="elecOk" ${nOn ? '' : 'disabled'}>${nOn ? 'Créer / mettre à jour ' + nOn + ' axe' + (nOn > 1 ? 's' : '') : 'Rien à faire'}</button><button class="btn" id="elecCancel">Fermer</button></div>`;
+    ${E.hw ? `<div class="memsg"><b>Matériel</b> : ${E.hw.rows.length} appareil${E.hw.rows.length > 1 ? 's' : ''} (CAN et ATV320, alimentations, têtes de bus et modules TM5, Ethernet/IP)${E.hw.change ? ` · ${E.hw.n.nouveau} nouveau${E.hw.n.nouveau > 1 ? 'x' : ''}, ${E.hw.n.maj} modifié${E.hw.n.maj > 1 ? 's' : ''}, ${E.hw.n.retires} retiré${E.hw.n.retires > 1 ? 's' : ''}` : ' · déjà à jour'}. Les variateurs DRV_, cartes IO_ et codeurs LE_ viennent des axes.
+      ${E.hw.retires.length ? `<br>Retirés du dossier : ${E.hw.retires.map(esc).join(', ')}.` : ''}${E.hw.remplaces.length ? `<br>Ajoutés à la main puis trouvés dans le dossier (remplacés) : ${E.hw.remplaces.map(esc).join(', ')}.` : ''}${E.hw.man.length ? `<br>Gardés (ajoutés à la main) : ${E.hw.man.map(x => esc(x.nom)).join(', ')}.` : ''}
+      ${E.hwWarn.length ? `<br><span class="el-warn">${E.hwWarn.map(esc).join(' · ')}</span>` : ''}</div>
+      ${hwTable(E.hw.rows, true)}
+      <label class="chk"><input type="checkbox" id="elecHw" ${E.hwOn ? 'checked' : ''} ${E.hw.change ? '' : 'disabled'}> Mettre à jour le matériel du projet</label>` : ''}
+    <button class="btn primary" id="elecOk" ${nOn || (E.hw && E.hw.change && E.hwOn) ? '' : 'disabled'}>${nOn || (E.hw && E.hw.change && E.hwOn) ? 'Appliquer' + (nOn ? ' · ' + nOn + ' axe' + (nOn > 1 ? 's' : '') : '') + (E.hw && E.hw.change && E.hwOn ? ' · matériel' : '') : 'Rien à faire'}</button><button class="btn" id="elecCancel">Fermer</button></div>`;
 }
 async function readElecFile(f) {
   try {
     setStatus('Lecture du dossier élec…');
-    const sheets = await xlsxSheets(await f.arrayBuffer(), ['Liste actionneurs']);
+    const sheets = await xlsxSheets(await f.arrayBuffer(), ['Liste actionneurs', 'Matériels']);
     const P = parseElec(sheets);
     if (!P.servo.length) throw new Error('aucun axe LXM62 / ILM62 trouvé dans « Liste actionneurs »');
-    S.projForm = null; S.meForm = null; S.elec = elecDiff(P, f.name); setStatus(''); renderProj();
+    const M = parseMateriel(sheets, P.asyn), hw = hwDiff(M.items);
+    S.projForm = null; S.meForm = null; S.hwView = false; S.elec = { ...elecDiff(P, f.name), hw, hwWarn: M.warn, hwOn: hw.change }; setStatus(''); renderProj();
   } catch (e) { S.elec = null; setStatus('Dossier élec illisible : ' + (e.message || e), true); renderProj(); }
 }
 async function applyElec() {
   if (S.dirty) { setStatus('Enregistre ou annule l’axe en cours avant d’importer.', true); return; }
-  const todo = S.elec.rows.filter(r => r.on && r.etat !== 'ok'); let n = 0;
+  const E = S.elec, todo = E.rows.filter(r => r.on && r.etat !== 'ok'); let n = 0, hwMsg = '';
   try {
+    if (E.hw && E.hw.change && E.hwOn) {
+      const cur = curProj(), clean = x => { const o = { nom: x.nom, type: x.type, parent: x.parent }; if (x.ip) o.ip = x.ip; if (x.nodeId != null) o.nodeId = x.nodeId; if (x.desc) o.desc = x.desc; return o; };
+      await writeDoc('projects', cur.id, { ...strip(cur), materiel: mergeHw(E.hw.rows.map(x => ({ ...clean(x), src: 'elec' })), E.hw.man) });
+      hwMsg = ' Matériel mis à jour (' + (E.hw.rows.length + E.hw.man.length) + ' appareils).';
+    }
     for (const r of todo) {
       if (r.a) await writeDoc('axes', r.a.id, { ...strip(r.a), ...r.want });
       else await writeDoc('axes', newId('axes'), { nom: r.nom, ...r.want, typeCharge: r.typeCharge, marge: 80, tStop: 0.2, projetId: S.projId, source: 'dossier élec' });
       n++;
     }
-    S.elec = null; setStatus(n + ' axe' + (n > 1 ? 's' : '') + ' créé' + (n > 1 ? 's' : '') + ' ou mis à jour depuis le dossier élec. Complète le réducteur et la charge de chacun.'); onData();
+    S.elec = null; setStatus((n ? n + ' axe' + (n > 1 ? 's' : '') + ' créé' + (n > 1 ? 's' : '') + ' ou mis à jour depuis le dossier élec. Complète le réducteur et la charge de chacun.' : '') + hwMsg); onData();
   } catch (e) { setStatus('Import arrêté après ' + n + ' axe(s) : ' + (e.message || e.code), true); }
 }
 function renderProj() {
@@ -1973,6 +2076,7 @@ function renderProj() {
   const n = cur ? pAxes().length : 0;
   b.innerHTML = `<span class="lbl">Projet</span>${S.projects.length ? `<select id="projSel" aria-label="Projet">${opts('en cours', 'En cours')}${opts('termine', 'Terminés')}</select>` : '<span class="muted">Aucun projet</span>'}
     ${done ? '<span class="pill done">Terminé</span>' : ''}<span class="grow"></span>
+    ${cur ? `<button class="btn ghost" id="projHw">Matériel${(cur.materiel || []).length ? ' (' + cur.materiel.length + ')' : ''}</button>` : ''}
     ${cur && !done ? '<button class="btn" id="projElec" title="Crée les axes du projet à partir du dossier électrique (.xlsm)">Importer le dossier élec</button><input type="file" id="elecFile" accept=".xlsm,.xlsx" hidden>' : ''}
     ${cur && pAxes().length && (S.dl || !S.db) ? '<button class="btn" id="projExp">Exporter (Excel)</button><button class="btn" id="projMe">Script Machine Expert</button>' : ''}
     ${cur ? `<button class="btn ghost" id="projRen">Renommer</button><button class="btn ghost" id="projDone">${done ? 'Rouvrir' : 'Terminer'}</button>` : ''}
@@ -1987,16 +2091,42 @@ function renderProj() {
       <label class="chk"><input type="checkbox" id="meGains" ${S.meForm.gains ? 'checked' : ''}> Gains Vel_P / Vel_I (gardés si notés, sinon proposés)</label>
       <label class="chk"><input type="checkbox" id="meListe" ${S.meForm.liste ? 'checked' : ''}> Liste de paramètres <b>ParameterList_Reglages</b> : créée ou complétée à la fin, avec tous les axes et une colonne par paramètre réglé</label>
       <button class="btn primary" id="meOk">Générer le script</button><button class="btn" id="meCancel">Annuler</button></div>` : ''}
-    ${S.elec && cur ? elecPanel() : ''}`;
+    ${S.elec && cur ? elecPanel() : ''}
+    ${S.hwView && cur && !S.elec && !S.meForm && !S.projForm ? hwPanel() : ''}`;
   const sel = $('#projSel'); if (sel) sel.onchange = () => { if (S.dirty && !confirm_()) { sel.value = S.projId; return; } S.projId = sel.value; S.axisId = null; S.dirty = false; S.draft = null; try { localStorage.setItem('servo-proj', S.projId); } catch (e) {} onData(); };
   $('#projNew').onclick = () => { S.projForm = { mode: 'new', nom: '', copy: false }; renderProj(); $('#pfNom').focus(); };
   const rn = $('#projRen'); if (rn) rn.onclick = () => { S.projForm = { mode: 'ren', nom: cur.nom }; renderProj(); $('#pfNom').focus(); };
   const ex = $('#projExp'); if (ex) ex.onclick = () => exportProject();
+  const ph = $('#projHw'); if (ph) ph.onclick = () => { S.hwView = !S.hwView; S.elec = null; S.meForm = null; S.projForm = null; renderProj(); };
+  if (S.hwView && cur && $('#hwAdd')) {
+    const f = S.hwForm, L = cur.materiel || [];
+    $('#hwNom').oninput = e => { f.nom = e.target.value; };
+    $('#hwType').onchange = e => { f.type = e.target.value; renderProj(); };
+    const hp = $('#hwParent'); if (hp) hp.onchange = e => { f.parent = e.target.value; };
+    const hv = $('#hwVal'); if (hv) hv.oninput = e => { f.val = e.target.value; };
+    $('#hwClose').onclick = () => { S.hwView = false; renderProj(); };
+    document.querySelectorAll('[data-hwdel]').forEach(b => { b.onclick = () => { const x = L[+b.dataset.hwdel]; hwSave(L.filter((_, k) => k !== +b.dataset.hwdel), '« ' + x.nom + ' » retiré du matériel.'); }; });
+    $('#hwAdd').onclick = () => {
+      const nom = hwName(f.nom); if (!nom) { setStatus('Donne un nom à l’appareil.', true); return; }
+      if (L.some(x => x.nom === nom) || pAxes().some(a => 'DRV_' + a.nom === nom)) { setStatus('« ' + nom + ' » existe déjà.', true); return; }
+      const isTm5 = /^TM5/.test(f.type) && f.type !== 'TM5NS31';
+      const x = { nom, type: f.type, parent: isTm5 ? (f.parent || 'TM5NS31 ?') : HW_CAT[f.type][4], src: 'manuel' };
+      if (f.type === 'ATV320') { const id = parseInt(f.val, 10); if (!(id > 0)) { setStatus('Donne le Node-ID de l’ATV320.', true); return; } x.nodeId = id; }
+      else if (HW_FAM(f.type) === 'Ethernet/IP' && f.val) x.ip = f.val.trim();
+      const anc = isTm5 ? f.parent : x.parent; let at = -1;
+      L.forEach((y, k) => { if (y.nom === anc || y.parent === anc) at = k; });
+      if (at >= 0) x.apres = L[at].nom;
+      const nl = L.slice(); if (at >= 0) nl.splice(at + 1, 0, x); else nl.push(x);
+      S.hwForm = { ...f, nom: '', val: '' };
+      hwSave(nl, '« ' + nom + ' » ajouté sous ' + x.parent + '.');
+    };
+  }
   const pe = $('#projElec'), fe = $('#elecFile');
   if (pe && fe) { pe.onclick = () => fe.click(); fe.onchange = () => { const f = fe.files[0]; fe.value = ''; if (f) readElecFile(f); }; }
   if (S.elec && $('#elecOk')) {
     document.querySelectorAll('[data-elec]').forEach(c => { c.onchange = () => { S.elec.rows[+c.dataset.elec].on = c.checked; renderProj(); }; });
     $('#elecCancel').onclick = () => { S.elec = null; renderProj(); };
+    const eh = $('#elecHw'); if (eh) eh.onchange = () => { S.elec.hwOn = eh.checked; renderProj(); };
     $('#elecOk').onclick = () => applyElec();
   }
   const me = $('#projMe'); if (me) me.onclick = () => { S.projForm = null; S.elec = null; S.meForm = S.meForm ? null : { meca: true, lim: true, stop: true, gains: true, liste: true }; renderProj(); };
